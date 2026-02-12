@@ -1,0 +1,26 @@
+# =============================
+# Core FastAPI
+# =============================
+fastapi
+uvicorn[standard]
+pydantic
+
+# =============================
+# AI & Data Processing
+# =============================
+numpy
+scikit-learn
+
+# =============================
+# HTTP Requests (for testing)
+# =============================
+requests
+
+# =============================
+# Development Tools (Optional)
+# =============================
+# mypy==1.8.0
+# black==24.1.1
+# isort==5.13.2
+# pytest==7.4.4
+# pytest-cov==4.1.0

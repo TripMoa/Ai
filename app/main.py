@@ -5,6 +5,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
+import sys, os
+sys.path.insert(0, os.path.dirname(__file__))
+
 from config import NAVER_MAP_CLIENT_ID
 from features.schedule.router import router as schedule_router
 

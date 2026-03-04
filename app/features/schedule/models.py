@@ -1,6 +1,5 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import Optional, Dict, List
-
 
 class PlaceInput(BaseModel):
     name: str
@@ -27,18 +26,96 @@ class UserPreferences(BaseModel):
     dinner_time: str = "18:00"
 
 
+# ─── 다중 숙소 ────────────────────────────────────────────────
+
+class HotelStay(BaseModel):
+    """날짜별 숙소 정보"""
+    name: str
+    lat: float
+    lng: float
+    address: Optional[str] = ""
+    check_in_day: int   # 1-based: 몇 일차에 체크인
+    check_out_day: int  # 체크아웃 일차 (이 날 아침에 이 숙소에서 출발)
+
+    @model_validator(mode="after")
+    def validate_days(self):
+        if self.check_out_day <= self.check_in_day:
+            raise ValueError(
+                f"check_out_day({self.check_out_day})는 "
+                f"check_in_day({self.check_in_day})보다 커야 합니다"
+            )
+        return self
+
+
+# ─── 다중 출발지 (신규) ───────────────────────────────────────
+
+class DeparturePoint(BaseModel):
+    """일차별 출발지 정보"""
+    name: str
+    lat: float
+    lng: float
+    address: Optional[str] = ""
+    day: int = 1  # 이 출발지를 사용할 일차 (1-based)
+    is_return_point: bool = False  # True면 마지막 날 복귀 기준점으로도 사용
+
+
 class ItineraryRequest(BaseModel):
     places: List[PlaceInput]
     n_days: int = 3
     transportation_mode: str = "대중교통"
-    hotel: Optional[Dict] = None
-    departure_point: Optional[Dict] = None
+
+    # ──────────── 숙소: 하위 호환 유지 ───────────────────
+    hotel: Optional[Dict] = None           # 기존: 단일 숙소 (deprecated)
+    hotels: Optional[List[HotelStay]] = [] # 다중 숙소
+
+    # ──────────── 출발지: 하위 호환 유지 ─────────────────
+    departure_point: Optional[Dict] = None                  # 기존: 단일 출발지 (deprecated)
+    departure_points: Optional[List[DeparturePoint]] = []   # 신규: 다중 출발지
+
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     daily_start_time: str = "09:00"
     daily_end_time: str = "18:00"
     pinned_places: Optional[List[PinnedPlace]] = []
     user_preferences: Optional[UserPreferences] = None
+
+    @model_validator(mode="after")
+    def migrate_single_hotel(self):
+        """
+        구버전 호환: hotel(단일 Dict)이 들어오고 hotels가 비어있으면
+        hotel을 1일차 체크인 ~ n_days일차 체크아웃으로 자동 변환
+        """
+        if self.hotel and not self.hotels:
+            self.hotels = [
+                HotelStay(
+                    name=self.hotel.get("name", "숙소"),
+                    lat=self.hotel["lat"],
+                    lng=self.hotel["lng"],
+                    address=self.hotel.get("address", ""),
+                    check_in_day=1,
+                    check_out_day=self.n_days,
+                )
+            ]
+        return self
+
+    @model_validator(mode="after")
+    def migrate_single_departure(self):
+        """
+        구버전 호환: departure_point(단일 Dict)가 들어오고 departure_points가 비어있으면
+        1일차 출발지 + 복귀 기준점으로 자동 변환
+        """
+        if self.departure_point and not self.departure_points:
+            self.departure_points = [
+                DeparturePoint(
+                    name=self.departure_point.get("name", "출발지"),
+                    lat=self.departure_point["lat"],
+                    lng=self.departure_point["lng"],
+                    address=self.departure_point.get("address", ""),
+                    day=1,
+                    is_return_point=True,
+                )
+            ]
+        return self
 
 
 class DistanceRequest(BaseModel):

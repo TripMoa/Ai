@@ -146,8 +146,8 @@ def is_address_query(query: str) -> bool:
 def categorize_place(naver_category: str) -> str:
     """네이버 카테고리 문자열 → 내부 카테고리"""
     c = naver_category.lower()
-    if any(k in c for k in _FOOD_KW):  return "맛집"
     if any(k in c for k in _CAFE_KW):  return "카페"
+    if any(k in c for k in _FOOD_KW):  return "맛집"
     if any(k in c for k in _SHOP_KW):  return "쇼핑"
     return "관광지"
 

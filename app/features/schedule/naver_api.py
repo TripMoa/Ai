@@ -64,7 +64,7 @@ async def local_search(query: str, display: int = 10) -> dict:
     if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
         return {"success": False, "places": [], "error": "Search API key not configured"}
 
-    print(f"🆓 지역 검색 API: '{query}'")
+    print(f"지역 검색 API: '{query}'")
     try:
         res = requests.get(
             "https://openapi.naver.com/v1/search/local.json",

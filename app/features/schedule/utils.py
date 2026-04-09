@@ -3,7 +3,7 @@ from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime, timedelta
 
 
-# ─── 좌표 / 거리 / 경로 ────────────────────────────────────────
+# ─── 좌표 / 거리 ───────────────────────────────────────────────
 
 def convert_naver_coords_to_wgs84(mapx, mapy) -> tuple[float | None, float | None]:
     """네이버 검색 API 좌표 → WGS84 위경도"""
@@ -27,26 +27,64 @@ def haversine_distance(place1: dict, place2: dict) -> float:
 
 
 def calculate_travel_time(place1: dict, place2: dict, mode: str = "대중교통") -> float:
-    """교통수단별 이동 시간 (분)"""
+    """
+    교통수단별 이동 시간 추정 (분).
+
+    직선 거리 기반이지만 도로 우회율(winding factor)과
+    교통수단별 특성을 반영해 현실적으로 보정:
+      - 도보:     도로 우회율 1.3, 속도 4 km/h, 5km 초과시 불가
+      - 대중교통: 도로 우회율 1.4, 탑승 대기/환승 오버헤드 추가
+                  단거리(<1km)는 도보 속도, 중거리는 20km/h, 장거리는 30km/h
+      - 택시:     도로 우회율 1.3, 단거리 최소 10분, 이후 30~40km/h
+
+    출발지 카테고리인 경우 공항/역 이동 시간으로 고정값 사용.
+    """
     if "출발지" in place1.get("category", "") or "출발지" in place2.get("category", ""):
         return {"도보": 999, "대중교통": 70, "택시": 50}.get(mode, 70)
 
     d = haversine_distance(place1, place2)
 
     if mode == "도보":
-        return 999 if d > 5 else (d / 4) * 60
-    elif mode == "대중교통":
-        if d < 1:    return (d / 4) * 60
-        elif d < 3:  return max((d / 4) * 60, 15)
-        elif d < 10: return 10 + (d / 20) * 60 + 5
-        else:        return 15 + (d / 25) * 60 + 10
-    elif mode == "택시":
-        if d < 2:    return 10
-        elif d < 10: return (d / 25) * 60 + 5
-        else:        return (d / 40) * 60 + 5
+        if d > 5:
+            return 999
+        road_d = d * 1.3
+        return (road_d / 4) * 60
 
+    elif mode == "대중교통":
+        road_d = d * 1.4
+        if d < 0.5:
+            # 걸어가는 게 빠른 거리 - 실질 도보
+            return (road_d / 4) * 60
+        elif d < 2:
+            # 버스/지하철 탑승 준비 + 환승 없음
+            transit_time = (road_d / 20) * 60
+            overhead = 10  # 대기
+            return transit_time + overhead
+        elif d < 10:
+            transit_time = (road_d / 25) * 60
+            overhead = 15  # 대기 + 환승 가능성
+            return transit_time + overhead
+        else:
+            transit_time = (road_d / 30) * 60
+            overhead = 20  # 환승 포함
+            return transit_time + overhead
+
+    elif mode == "택시":
+        road_d = d * 1.3
+        if d < 1:
+            return 10  # 최소 요금 구간
+        elif d < 5:
+            return (road_d / 25) * 60 + 5
+        elif d < 20:
+            return (road_d / 35) * 60 + 5
+        else:
+            return (road_d / 40) * 60 + 5
+
+    # 기본 fallback
     return 15 + (d / 20) * 60
 
+
+# ─── 경로 최적화 ───────────────────────────────────────────────
 
 def nearest_neighbor_route(places: list, start: dict) -> list:
     """Nearest Neighbor 경로 최적화"""
@@ -59,6 +97,52 @@ def nearest_neighbor_route(places: list, start: dict) -> list:
         current = places[idx]
         unvisited.remove(idx)
     return route
+
+
+def two_opt_improve(route: list, mode: str = "대중교통", max_iter: int = 100) -> list:
+    """
+    2-opt 교환으로 Nearest Neighbor 결과를 개선.
+    교환 후 총 이동 시간이 줄어들면 채택.
+    장소가 3개 미만이면 그대로 반환.
+    """
+    if len(route) < 3:
+        return route
+
+    def total_time(r: list) -> float:
+        return sum(
+            calculate_travel_time(r[i], r[i + 1], mode)
+            for i in range(len(r) - 1)
+        )
+
+    best = list(route)
+    improved = True
+    iteration = 0
+
+    while improved and iteration < max_iter:
+        improved = False
+        iteration += 1
+        for i in range(len(best) - 1):
+            for j in range(i + 2, len(best)):
+                before = (
+                    calculate_travel_time(best[i], best[i + 1], mode)
+                    + calculate_travel_time(best[j - 1], best[j], mode)
+                    if j < len(best) else 0
+                )
+                after = (
+                    calculate_travel_time(best[i], best[j - 1], mode)
+                    + calculate_travel_time(best[i + 1], best[j], mode)
+                    if j < len(best) else 0
+                )
+                if after < before - 0.5:  # 0.5분 이상 개선될 때만 교환
+                    best[i + 1:j] = best[i + 1:j][::-1]
+                    improved = True
+    return best
+
+
+def optimized_route(places: list, start: dict, mode: str = "대중교통") -> list:
+    """Nearest Neighbor 후 2-opt 개선"""
+    nn = nearest_neighbor_route(places, start)
+    return two_opt_improve(nn, mode)
 
 
 # ─── 시간 / 날짜 ───────────────────────────────────────────────

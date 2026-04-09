@@ -1,14 +1,13 @@
 from pydantic import BaseModel, model_validator
 from typing import Optional, Dict, List
 
+
 class PlaceInput(BaseModel):
     name: str
     lat: float
     lng: float
     category: str = "관광지"
     address: Optional[str] = ""
-    open_time: Optional[str] = None
-    close_time: Optional[str] = None
     is_landmark: bool = False
     is_unique: bool = False
 
@@ -47,7 +46,7 @@ class HotelStay(BaseModel):
         return self
 
 
-# ─── 다중 출발지 (신규) ───────────────────────────────────────
+# ─── 다중 출발지 ──────────────────────────────────────────────
 
 class DeparturePoint(BaseModel):
     """일차별 출발지 정보"""
@@ -70,7 +69,7 @@ class ItineraryRequest(BaseModel):
 
     # ──────────── 출발지: 하위 호환 유지 ─────────────────
     departure_point: Optional[Dict] = None                  # 기존: 단일 출발지 (deprecated)
-    departure_points: Optional[List[DeparturePoint]] = []   # 신규: 다중 출발지
+    departure_points: Optional[List[DeparturePoint]] = []   # 다중 출발지
 
     start_date: Optional[str] = None
     end_date: Optional[str] = None
@@ -81,10 +80,6 @@ class ItineraryRequest(BaseModel):
 
     @model_validator(mode="after")
     def migrate_single_hotel(self):
-        """
-        구버전 호환: hotel(단일 Dict)이 들어오고 hotels가 비어있으면
-        hotel을 1일차 체크인 ~ n_days일차 체크아웃으로 자동 변환
-        """
         if self.hotel and not self.hotels:
             self.hotels = [
                 HotelStay(
@@ -100,10 +95,6 @@ class ItineraryRequest(BaseModel):
 
     @model_validator(mode="after")
     def migrate_single_departure(self):
-        """
-        구버전 호환: departure_point(단일 Dict)가 들어오고 departure_points가 비어있으면
-        1일차 출발지 + 복귀 기준점으로 자동 변환
-        """
         if self.departure_point and not self.departure_points:
             self.departure_points = [
                 DeparturePoint(
@@ -115,6 +106,20 @@ class ItineraryRequest(BaseModel):
                     is_return_point=True,
                 )
             ]
+        return self
+
+    @model_validator(mode="after")
+    def deduplicate_departure_points(self):
+        """같은 day의 출발지가 중복으로 들어오면 첫 번째만 유지"""
+        if not self.departure_points:
+            return self
+        seen_days: set[int] = set()
+        deduped = []
+        for dp in self.departure_points:
+            if dp.day not in seen_days:
+                deduped.append(dp)
+                seen_days.add(dp.day)
+        self.departure_points = deduped
         return self
 
 

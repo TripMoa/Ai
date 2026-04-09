@@ -38,7 +38,6 @@ async def search_place(query: str, display: int = 10):
         if result["success"] and result["places"]:
             return _build_response(result["places"], query, "geocoding", "geocoding (유료)")
 
-        # Geocoding 실패 → 지역 검색 폴백
         print("Geocoding 실패 → 지역 검색 폴백")
         result = await local_search(query, display)
         _fill_category(result.get("places", []))
@@ -65,12 +64,12 @@ def _fill_category(places: list) -> None:
 
 def _build_response(places, query, method, api_used, total=None) -> dict:
     return {
-        "success": True,
-        "total":   total if total is not None else len(places),
-        "display": len(places),
-        "places":  places,
-        "query":   query,
-        "method":  method,
+        "success":  True,
+        "total":    total if total is not None else len(places),
+        "display":  len(places),
+        "places":   places,
+        "query":    query,
+        "method":   method,
         "api_used": api_used,
     }
 
@@ -93,8 +92,6 @@ async def generate(request: ItineraryRequest):
             print(f"n_days 보정: {request.n_days} → {calculated}")
             request.n_days = calculated
 
-    # 출발지·숙소는 별도 관리되므로 일반 장소만 검증
-    # 최소 n_days개 (하루 1곳 이상)
     if len(request.places) < request.n_days:
         raise HTTPException(
             status_code=400,
@@ -106,31 +103,30 @@ async def generate(request: ItineraryRequest):
         for p in request.places
     ])
 
+    # models.py validator에서 이미 hotels/departure_points로 변환 완료
     itinerary = generate_itinerary(
-        request.places,
-        request.n_days,
-        request.transportation_mode,
-        hotel=request.hotel,                      # deprecated (models에서 hotels로 이미 변환됨)
-        hotels=request.hotels or [],              # 다중 숙소
-        departure_point=request.departure_point,  # deprecated (models에서 departure_points로 변환됨)
-        departure_points=request.departure_points or [],  # 다중 출발지
-        start_date=request.start_date,
-        daily_start_time=request.daily_start_time,
-        daily_end_time=request.daily_end_time,
-        pinned_places=request.pinned_places,
-        user_preferences=request.user_preferences,
+        places           = request.places,
+        n_days           = request.n_days,
+        transport_mode   = request.transportation_mode,
+        hotels           = request.hotels or [],
+        departure_points = request.departure_points or [],
+        start_date       = request.start_date,
+        daily_start_time = request.daily_start_time,
+        daily_end_time   = request.daily_end_time,
+        pinned_places    = request.pinned_places,
+        user_preferences = request.user_preferences,
     )
 
     prefs = request.user_preferences
     dps   = request.departure_points or []
 
     return {
-        "success": True,
-        "message": "일정 생성 완료",
+        "success":   True,
+        "message":   "일정 생성 완료",
         "itinerary": itinerary,
         "warnings": {
-            "duplicates": duplicates,
-            "has_duplicates": bool(duplicates),
+            "duplicates":           duplicates,
+            "has_duplicates":       bool(duplicates),
             "high_severity_count":   sum(1 for d in duplicates if d.get("severity") == "high"),
             "medium_severity_count": sum(1 for d in duplicates if d.get("severity") == "medium"),
         },
@@ -140,19 +136,17 @@ async def generate(request: ItineraryRequest):
             "end_date":            request.end_date,
             "transportation_mode": request.transportation_mode,
             "total_places":        len(request.places),
-            # ── 숙소 ──────────────────────────────────────────
-            "has_hotel":    bool(request.hotels),
-            "hotels_count": len(request.hotels or []),
+            "has_hotel":           bool(request.hotels),
+            "hotels_count":        len(request.hotels or []),
             "hotels": [
                 {
-                    "name":         h.name,
+                    "name":          h.name,
                     "check_in_day":  h.check_in_day,
                     "check_out_day": h.check_out_day,
                     "nights":        h.check_out_day - h.check_in_day,
                 }
                 for h in (request.hotels or [])
             ],
-            # ── 출발지 (신규) ─────────────────────────────────
             "has_departure_point":    bool(dps),
             "departure_points_count": len(dps),
             "departure_points": [
@@ -165,7 +159,6 @@ async def generate(request: ItineraryRequest):
                 }
                 for dp in dps
             ],
-            # ── 기타 ──────────────────────────────────────────
             "daily_start_time":    request.daily_start_time,
             "daily_end_time":      request.daily_end_time,
             "pinned_places_count": len(request.pinned_places or []),
@@ -182,7 +175,7 @@ async def generate(request: ItineraryRequest):
 async def calculate_distance(request: DistanceRequest):
     try:
         return {
-            "success": True,
+            "success":             True,
             "distance_km":         round(haversine_distance(request.place1, request.place2), 2),
             "travel_time_minutes": round(calculate_travel_time(request.place1, request.place2, request.mode)),
         }

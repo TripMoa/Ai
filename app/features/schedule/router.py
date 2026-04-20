@@ -5,7 +5,7 @@ from config import NAVER_CLIENT_ID
 from features.schedule.naver_api import geocode_address, local_search
 from features.schedule.utils import (
     haversine_distance, calculate_travel_time,
-    is_address_query, categorize_place, check_duplicate_places,
+    is_address_query, categorize_place,
 )
 from features.schedule.models import ItineraryRequest, DistanceRequest
 from features.schedule.service import generate_itinerary
@@ -98,11 +98,6 @@ async def generate(request: ItineraryRequest):
             detail=f"{request.n_days}일 여행에는 최소 {request.n_days}개 이상의 장소가 필요합니다",
         )
 
-    duplicates = check_duplicate_places([
-        {"name": p.name, "lat": p.lat, "lng": p.lng, "category": p.category}
-        for p in request.places
-    ])
-
     # models.py validator에서 이미 hotels/departure_points로 변환 완료
     itinerary = generate_itinerary(
         places           = request.places,
@@ -116,9 +111,13 @@ async def generate(request: ItineraryRequest):
         pinned_places    = request.pinned_places,
         user_preferences = request.user_preferences,
     )
-
+    import json
+    print("\n===== 일정 생성 결과 =====")
+    print(json.dumps(itinerary, indent=2, ensure_ascii=False))
+    
     prefs = request.user_preferences
     dps   = request.departure_points or []
+    duplicates = itinerary.pop("duplicates", [])
 
     return {
         "success":   True,

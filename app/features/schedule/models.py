@@ -1,5 +1,19 @@
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, model_validator, field_validator
 from typing import Optional, Dict, List
+
+# ─── 카테고리 정규화 맵 ───────────────────────────────────────
+# 프론트에서 "관광"으로 넘어오면 "관광지"로 자동 변환
+# 이 맵에 없는 값은 원본 유지 (하위 호환)
+_CATEGORY_NORMALIZE: dict[str, str] = {
+    "관광":  "관광지",
+    "관광지": "관광지",
+    "맛집":  "맛집",
+    "카페":  "카페",
+    "쇼핑":  "쇼핑",
+    "숙소":  "숙소",
+    "교통":  "출발지",   # 프론트 "교통" → 백엔드 "출발지" (공항/기차역 등 이동 거점)
+    "출발지": "출발지",  # 이미 변환된 값도 통과
+}
 
 
 class PlaceInput(BaseModel):
@@ -11,12 +25,18 @@ class PlaceInput(BaseModel):
     is_landmark: bool = False
     is_unique: bool = False
 
+    @field_validator("category", mode="before")
+    @classmethod
+    def normalize_category(cls, v: str) -> str:
+        """프론트 카테고리명("관광")을 백엔드 내부명("관광지")으로 자동 정규화."""
+        normalized = _CATEGORY_NORMALIZE.get(str(v).strip(), v)
+        return normalized
+
 
 class PinnedPlace(BaseModel):
     place_index: int
     day: int
     time: Optional[str] = None
-    priority: str = "must"  # must | high | medium
 
 
 class UserPreferences(BaseModel):
@@ -33,8 +53,8 @@ class HotelStay(BaseModel):
     lat: float
     lng: float
     address: Optional[str] = ""
-    check_in_day: int   # 1-based: 몇 일차에 체크인
-    check_out_day: int  # 체크아웃 일차 (이 날 아침에 이 숙소에서 출발)
+    check_in_day: int
+    check_out_day: int
 
     @model_validator(mode="after")
     def validate_days(self):
@@ -54,59 +74,22 @@ class DeparturePoint(BaseModel):
     lat: float
     lng: float
     address: Optional[str] = ""
-    day: int = 1  # 이 출발지를 사용할 일차 (1-based)
-    is_return_point: bool = False  # True면 마지막 날 복귀 기준점으로도 사용
+    day: int = 1
+    is_return_point: bool = False
 
 
 class ItineraryRequest(BaseModel):
     places: List[PlaceInput]
     n_days: int = 3
     transportation_mode: str = "대중교통"
-
-    # ──────────── 숙소: 하위 호환 유지 ───────────────────
-    hotel: Optional[Dict] = None           # 기존: 단일 숙소 (deprecated)
-    hotels: Optional[List[HotelStay]] = [] # 다중 숙소
-
-    # ──────────── 출발지: 하위 호환 유지 ─────────────────
-    departure_point: Optional[Dict] = None                  # 기존: 단일 출발지 (deprecated)
-    departure_points: Optional[List[DeparturePoint]] = []   # 다중 출발지
-
+    hotels: Optional[List[HotelStay]] = []
+    departure_points: Optional[List[DeparturePoint]] = []
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     daily_start_time: str = "09:00"
     daily_end_time: str = "18:00"
     pinned_places: Optional[List[PinnedPlace]] = []
     user_preferences: Optional[UserPreferences] = None
-
-    @model_validator(mode="after")
-    def migrate_single_hotel(self):
-        if self.hotel and not self.hotels:
-            self.hotels = [
-                HotelStay(
-                    name=self.hotel.get("name", "숙소"),
-                    lat=self.hotel["lat"],
-                    lng=self.hotel["lng"],
-                    address=self.hotel.get("address", ""),
-                    check_in_day=1,
-                    check_out_day=self.n_days,
-                )
-            ]
-        return self
-
-    @model_validator(mode="after")
-    def migrate_single_departure(self):
-        if self.departure_point and not self.departure_points:
-            self.departure_points = [
-                DeparturePoint(
-                    name=self.departure_point.get("name", "출발지"),
-                    lat=self.departure_point["lat"],
-                    lng=self.departure_point["lng"],
-                    address=self.departure_point.get("address", ""),
-                    day=1,
-                    is_return_point=True,
-                )
-            ]
-        return self
 
     @model_validator(mode="after")
     def deduplicate_departure_points(self):

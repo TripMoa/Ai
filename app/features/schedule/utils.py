@@ -1,7 +1,9 @@
 import re
+import logging
 from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime, timedelta
 
+logger = logging.getLogger(__name__)
 
 # ─── 좌표 / 거리 ───────────────────────────────────────────────
 
@@ -30,14 +32,13 @@ def calculate_travel_time(place1: dict, place2: dict, mode: str = "대중교통"
     """
     교통수단별 이동 시간 추정 (분).
 
-    직선 거리 기반이지만 도로 우회율(winding factor)과
-    교통수단별 특성을 반영해 현실적으로 보정:
-      - 도보:     도로 우회율 1.3, 속도 4 km/h, 5km 초과시 불가
-      - 대중교통: 도로 우회율 1.4, 탑승 대기/환승 오버헤드 추가
-                  단거리(<1km)는 도보 속도, 중거리는 20km/h, 장거리는 30km/h
-      - 택시:     도로 우회율 1.3, 단거리 최소 10분, 이후 30~40km/h
+    ⚠️ 직선 거리(하버사인) 기반 추정치입니다.
+       실제 도로/대중교통 경로와 차이가 있을 수 있습니다.
+       도로 우회율(winding factor)과 교통수단별 특성을 반영해 보정합니다.
 
-    출발지 카테고리인 경우 공항/역 이동 시간으로 고정값 사용.
+    - 도보:     도로 우회율 1.3, 속도 4 km/h, 5km 초과시 불가
+    - 대중교통: 도로 우회율 1.4, 탑승 대기/환승 오버헤드 추가
+    - 택시:     도로 우회율 1.3, 단거리 최소 10분
     """
     if "출발지" in place1.get("category", "") or "출발지" in place2.get("category", ""):
         return {"도보": 999, "대중교통": 70, "택시": 50}.get(mode, 70)
@@ -53,26 +54,18 @@ def calculate_travel_time(place1: dict, place2: dict, mode: str = "대중교통"
     elif mode == "대중교통":
         road_d = d * 1.4
         if d < 0.5:
-            # 걸어가는 게 빠른 거리 - 실질 도보
             return (road_d / 4) * 60
         elif d < 2:
-            # 버스/지하철 탑승 준비 + 환승 없음
-            transit_time = (road_d / 20) * 60
-            overhead = 10  # 대기
-            return transit_time + overhead
+            return (road_d / 20) * 60 + 10
         elif d < 10:
-            transit_time = (road_d / 25) * 60
-            overhead = 15  # 대기 + 환승 가능성
-            return transit_time + overhead
+            return (road_d / 25) * 60 + 15
         else:
-            transit_time = (road_d / 30) * 60
-            overhead = 20  # 환승 포함
-            return transit_time + overhead
+            return (road_d / 30) * 60 + 20
 
     elif mode == "택시":
         road_d = d * 1.3
         if d < 1:
-            return 10  # 최소 요금 구간
+            return 10
         elif d < 5:
             return (road_d / 25) * 60 + 5
         elif d < 20:
@@ -80,7 +73,6 @@ def calculate_travel_time(place1: dict, place2: dict, mode: str = "대중교통"
         else:
             return (road_d / 40) * 60 + 5
 
-    # 기본 fallback
     return 15 + (d / 20) * 60
 
 
@@ -133,7 +125,7 @@ def two_opt_improve(route: list, mode: str = "대중교통", max_iter: int = 100
                     + calculate_travel_time(best[i + 1], best[j], mode)
                     if j < len(best) else 0
                 )
-                if after < before - 0.5:  # 0.5분 이상 개선될 때만 교환
+                if after < before - 0.5:
                     best[i + 1:j] = best[i + 1:j][::-1]
                     improved = True
     return best
@@ -178,7 +170,9 @@ def calculate_dates(start_date: str, n_days: int) -> list[dict]:
         return [
             {
                 "date": (start + timedelta(days=i)).strftime("%Y-%m-%d"),
-                "formatted": format_date_korean((start + timedelta(days=i)).strftime("%Y-%m-%d")),
+                "formatted": format_date_korean(
+                    (start + timedelta(days=i)).strftime("%Y-%m-%d")
+                ),
                 "day_num": i + 1,
             }
             for i in range(n_days)

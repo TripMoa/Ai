@@ -3,6 +3,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
+from features.ocr.router import router as ocr_router
 import uvicorn
 
 import sys, os
@@ -23,6 +24,7 @@ app.add_middleware(
 )
 
 app.include_router(schedule_router)
+app.include_router(ocr_router)
 
 
 @app.get("/", response_class=HTMLResponse)

@@ -12,6 +12,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from config import NAVER_MAP_CLIENT_ID
 from features.schedule.router import router as schedule_router
 
+from features.matetag.router import router as tag_router
+
 BASE_DIR = Path(__file__).parent
 
 app = FastAPI(title="Travel AI", version="1.0.0")
@@ -25,6 +27,7 @@ app.add_middleware(
 
 app.include_router(schedule_router)
 app.include_router(ocr_router)
+app.include_router(tag_router)
 
 
 @app.get("/", response_class=HTMLResponse)

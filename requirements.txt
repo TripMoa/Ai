@@ -1,20 +1,21 @@
 # =============================
 # Core FastAPI
 # =============================
-fastapi
-uvicorn[standard]
-pydantic
+fastapi==0.115.0
+uvicorn[standard]==0.30.0
+pydantic==2.7.0
+jinja2
 
 # =============================
 # AI & Data Processing
 # =============================
-numpy
-scikit-learn
+numpy==1.26.4
+scikit-learn==1.4.2
 
 # =============================
-# HTTP Requests (for testing)
+# HTTP Requests
 # =============================
-requests
+requests==2.32.3
 
 # =============================
 # Development Tools (Optional)
@@ -23,4 +24,4 @@ requests
 # black==24.1.1
 # isort==5.13.2
 # pytest==7.4.4
-# pytest-cov==4.1.0
+# pytest-cov==4.1.0cls

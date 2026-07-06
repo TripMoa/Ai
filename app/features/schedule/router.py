@@ -173,10 +173,11 @@ async def generate(request: ItineraryRequest):
 @router.post("/calculate_distance")
 async def calculate_distance(request: DistanceRequest):
     try:
+        travel = calculate_travel_time(request.place1, request.place2, request.mode)
         return {
             "success":             True,
             "distance_km":         round(haversine_distance(request.place1, request.place2), 2),
-            "travel_time_minutes": round(calculate_travel_time(request.place1, request.place2, request.mode)),
+            "travel_time_minutes": round(travel["time"]),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -20,6 +20,7 @@ from features.schedule.utils import (
     check_duplicate_places, check_category_sequence,
     haversine_distance,
 )
+from features.schedule.odsay_api import CallCounter
 from features.schedule.models import UserPreferences, HotelStay, DeparturePoint
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,23 @@ _BASE_STAY: dict[str, int] = {
 }
 _LANDMARK_BONUS = 30
 _UNIQUE_BONUS   = 20
+
+# 장소 이름 키워드로 체류시간을 세분화 — "관광지" 한 카테고리 안에도
+# 궁궐(오래 머묾)부터 전망대(잠깐 들름)까지 편차가 커서, 카테고리 하나로
+# 뭉뚱그리면 하루 일정 과부하 판단(is_over_time, max_per_day)이 부정확해진다.
+# 새 데이터/API 없이 이미 갖고 있는 장소명만으로 판단한다.
+_STAY_KEYWORD_OVERRIDES: list[tuple[list[str], int]] = [
+    (["궁", "고궁", "박물관", "미술관", "테마파크", "동물원", "수족관", "생태공원"], 120),
+    (["전망대", "포토존", "다리", "야경", "분수", "정류장", "역"], 30),
+    (["시장", "거리", "골목", "공원"], 60),
+]
+
+
+def _keyword_stay_override(name: str) -> int | None:
+    for keywords, minutes in _STAY_KEYWORD_OVERRIDES:
+        if any(kw in name for kw in keywords):
+            return minutes
+    return None
 
 PACE_MULTIPLIER: dict[str, float] = {"tight": 0.7, "normal": 1.0, "relaxed": 1.3}
 
@@ -99,7 +117,8 @@ def _get_return_point(departure_points: list[DeparturePoint]) -> dict | None:
 # ─── 1. 장소 보강 ──────────────────────────────────────────────
 
 def _adjusted_stay(place_dict: dict, pace: str) -> int:
-    base = _BASE_STAY.get(place_dict.get("category", "관광지"), 60)
+    keyword_override = _keyword_stay_override(place_dict.get("name", ""))
+    base = keyword_override if keyword_override is not None else _BASE_STAY.get(place_dict.get("category", "관광지"), 60)
     if place_dict.get("is_landmark"):
         base += _LANDMARK_BONUS
     if place_dict.get("is_unique"):
@@ -119,7 +138,7 @@ def _enrich_places(places, pace: str) -> list[dict]:
             "is_unique":   p.is_unique,
             "pinned":      False,
             "stay": _adjusted_stay(
-                {"category": p.category, "is_landmark": p.is_landmark, "is_unique": p.is_unique},
+                {"name": p.name, "category": p.category, "is_landmark": p.is_landmark, "is_unique": p.is_unique},
                 pace,
             ),
         }
@@ -295,8 +314,8 @@ def _assign_places_to_days(
         key = _anchor_key(i)
         anchor_groups.setdefault(key, []).append(i)
 
-    assignments: list[list[dict]] = [[] for _ in range(n_days)]
-
+    # ── 장소를 가장 가까운 앵커 그룹으로 먼저 묶는다 ─────────
+    places_by_anchor_key: dict[tuple, list[dict]] = {k: [] for k in anchor_groups}
     for place in unassigned:
         best_anchor_key = min(
             anchor_groups.keys(),
@@ -304,9 +323,25 @@ def _assign_places_to_days(
                 {"lat": k[0], "lng": k[1]}, place
             ) if k[0] is not None else float("inf"),
         )
-        group = anchor_groups[best_anchor_key]
-        best_day = min(group, key=lambda i: len(assignments[i]))
-        assignments[best_day].append(place)
+        places_by_anchor_key[best_anchor_key].append(place)
+
+    assignments: list[list[dict]] = [[] for _ in range(n_days)]
+
+    for key, group_days in anchor_groups.items():
+        group_places = places_by_anchor_key[key]
+        if len(group_days) == 1:
+            assignments[group_days[0]] = group_places
+            continue
+
+        # 여행 내내 숙소가 그대로라 여러 날이 같은 앵커를 공유하는 경우,
+        # 앵커까지의 거리만으로는 어느 날에 넣을지 구분이 안 된다. 그대로
+        # 두면 장소 개수만 맞춰 배정하다가(라운드로빈) 수원처럼 멀리 떨어진
+        # 지역의 장소들이 하루에 묶이지 않고 여러 날에 흩어져서, 같은 지역을
+        # 왕복하는 이동이 중복되는 문제가 생긴다. 장소들끼리의 지리적
+        # 근접성으로 나눠서 같은 지역은 같은 날에 묶는다.
+        sub_clusters = _geographic_cluster(group_places, len(group_days))
+        for day_idx, cluster in zip(group_days, sub_clusters):
+            assignments[day_idx] = cluster
 
     # ── 날짜별 균형 보정 ──────────────────────────────────
     for _ in range(n_days * len(unassigned)):
@@ -338,56 +373,167 @@ def _assign_places_to_days(
 
 # ─── 4. 재분배 ────────────────────────────────────────────────
 
+_CAFE_CAP_BY_PACE: dict[str, int] = {"tight": 1, "normal": 2, "relaxed": 2}
+
+
+def _cap_category_places(
+    day_assignments: list[list],
+    day_anchors: list[dict | None],
+    category: str,
+    cap: int,
+    reason: str,
+) -> tuple[list[list], list[dict]]:
+    """
+    하루 중 특정 카테고리 장소 개수가 cap을 넘으면 앵커(숙소/출발지)에서 가장
+    먼 것부터 초과분으로 간주해 제외한다. _cap_meal_places/_cap_cafe_places가
+    공유하는 공통 로직.
+    """
+    n_days = len(day_assignments)
+    result = [list(d) for d in day_assignments]
+    excluded: list[dict] = []
+
+    for day_idx in range(n_days):
+        matched = [p for p in result[day_idx] if p.get("category") == category]
+        if len(matched) <= cap:
+            continue
+
+        anchor = day_anchors[day_idx]
+        if anchor is not None:
+            matched.sort(key=lambda p: haversine_distance(anchor, p))
+
+        keep_names = {p["name"] for p in matched[:cap]}
+        drop_names = {p["name"] for p in matched} - keep_names
+
+        for name in drop_names:
+            dropped = next(p for p in result[day_idx] if p["name"] == name)
+            logger.info(
+                "  [제외] '%s' Day %d — %s(%d개) 초과",
+                name, day_idx + 1, category, cap
+            )
+            excluded.append({
+                "name":     dropped["name"],
+                "category": dropped["category"],
+                "day":      day_idx + 1,
+                "reason":   reason,
+            })
+        result[day_idx] = [p for p in result[day_idx] if p["name"] not in drop_names]
+
+    return result, excluded
+
+
+def _cap_meal_places(
+    day_assignments: list[list],
+    day_anchors: list[dict | None],
+    meal_slot_count: int,
+) -> tuple[list[list], list[dict]]:
+    """
+    하루 식사 시간대(점심/저녁) 개수를 넘는 "맛집"은 초과분으로 간주해 제외한다.
+
+    지리적 배정(_assign_places_to_days)은 카테고리를 전혀 고려하지 않기 때문에,
+    맛집이 특정 날에 3개 이상 몰리면 _arrange_meals_in_places()가 최대 2개
+    (점심/저녁)만 식사 시간에 맞춰 옮기고 나머지는 그 자리에 남아 다른 맛집과
+    나란히 배치되는 문제가 있었다. 여기서 미리 개수를 식사 슬롯 수만큼 잘라낸다.
+    """
+    return _cap_category_places(day_assignments, day_anchors, "맛집", meal_slot_count, "meal_slot_limit")
+
+
+def _cap_cafe_places(
+    day_assignments: list[list],
+    day_anchors: list[dict | None],
+    pace: str,
+) -> tuple[list[list], list[dict]]:
+    """
+    카페는 맛집과 달리 고정된 식사 시간대가 없어 슬롯 수 대신 페이스 기반
+    고정 상한(tight=1, normal/relaxed=2)을 쓴다.
+    """
+    cap = _CAFE_CAP_BY_PACE.get(pace, 2)
+    return _cap_category_places(day_assignments, day_anchors, "카페", cap, "cafe_limit")
+
+
 def _redistribute(
     day_assignments: list[list],
     day_anchors: list[dict | None],
     max_per_day: int,
     hotels: list,
     transport_mode: str,
-) -> list[list]:
+) -> tuple[list[list], list[dict]]:
     n_days = len(day_assignments)
     result = [list(d) for d in day_assignments]
+    excluded: list[dict] = []
 
     for day_idx in range(n_days):
         limit = _max_places_for_day(day_idx, hotels, max_per_day)
         if len(result[day_idx]) <= limit:
             continue
 
-        anchor = day_anchors[day_idx]
-        if anchor:
-            result[day_idx].sort(
-                key=lambda p: haversine_distance(anchor, p), reverse=True
+        candidates = result[day_idx]
+
+        # ── 군집 밀도 기반 최적 조합 선택 ──────────────────────
+        # 각 장소에 대해 "주변 장소들과의 평균 거리"를 계산해서
+        # 서로 가장 밀집된 limit개 조합을 선택한다.
+        #
+        # 알고리즘:
+        #   1. 모든 장소 쌍 거리 계산
+        #   2. 각 장소의 "군집 점수" = 가장 가까운 (limit-1)개 장소까지의 평균 거리
+        #      → 점수가 낮을수록 주변에 장소가 밀집되어 있음
+        #   3. 군집 점수 낮은 순으로 limit개 선택
+        #   4. 선택 결과에 "맛집"이 하나도 없으면 가장 군집 점수가 좋은 맛집으로
+        #      가장 점수가 나쁜 항목 하나를 교체 (식사 장소가 통째로 잘리는 것 방지)
+
+        n = len(candidates)
+
+        # 장소 간 거리 행렬
+        dist_matrix = [
+            [haversine_distance(candidates[i], candidates[j]) for j in range(n)]
+            for i in range(n)
+        ]
+
+        # 각 장소의 군집 점수: 자신 제외 가장 가까운 (limit-1)개의 평균 거리
+        k = min(limit - 1, n - 1)
+        cluster_scores = []
+        for i in range(n):
+            neighbors = sorted(dist_matrix[i][j] for j in range(n) if j != i)
+            avg_dist = sum(neighbors[:k]) / k if k > 0 else 0
+            cluster_scores.append((avg_dist, i))
+
+        cluster_scores.sort()  # 평균 거리 오름차순 = 밀집된 장소 우선
+        score_by_idx = {idx: score for score, idx in cluster_scores}
+
+        selected_idx = set(idx for _, idx in cluster_scores[:limit])
+
+        # ── 카테고리 균형 안전망: 식사 장소·카페가 전부 잘리지 않도록 ──
+        selected_categories = {candidates[i]["category"] for i in selected_idx}
+        for safety_category in ("맛집", "카페"):
+            if safety_category in selected_categories:
+                continue
+            same_category_candidates = [
+                i for i in range(n) if candidates[i]["category"] == safety_category
+            ]
+            if not same_category_candidates:
+                continue
+            best_idx = min(same_category_candidates, key=lambda i: score_by_idx[i])
+            worst_selected_idx = max(selected_idx, key=lambda i: score_by_idx[i])
+            selected_idx.discard(worst_selected_idx)
+            selected_idx.add(best_idx)
+            selected_categories.add(safety_category)
+
+        dropped_idx = set(range(n)) - selected_idx
+
+        result[day_idx] = [candidates[i] for i in range(n) if i in selected_idx]
+
+        for i in dropped_idx:
+            logger.info(
+                "  [제외] '%s' Day %d — 동선 최적화 (군집 밀도 기반)",
+                candidates[i]["name"], day_idx + 1
             )
+            excluded.append({
+                "name":     candidates[i]["name"],
+                "category": candidates[i]["category"],
+                "day":      day_idx + 1,
+                "reason":   "capacity",
+            })
 
-        overflow = result[day_idx][limit:]
-        result[day_idx] = result[day_idx][:limit]
-
-        for place in overflow:
-            placed = False
-            for target in range(day_idx + 1, n_days):
-                target_limit = _max_places_for_day(target, hotels, max_per_day)
-                if len(result[target]) < target_limit:
-                    result[target].append(place)
-                    logger.debug("  [재분배] '%s' Day %d → Day %d", place["name"], day_idx + 1, target + 1)
-                    if day_anchors[target]:
-                        result[target] = optimized_route(result[target], day_anchors[target], transport_mode)
-                    placed = True
-                    break
-            if not placed:
-                for target in range(day_idx - 1, -1, -1):
-                    target_limit = _max_places_for_day(target, hotels, max_per_day)
-                    if len(result[target]) < target_limit:
-                        result[target].append(place)
-                        logger.debug("  [재분배 역방향] '%s' Day %d → Day %d", place["name"], day_idx + 1, target + 1)
-                        if day_anchors[target]:
-                            result[target] = optimized_route(result[target], day_anchors[target], transport_mode)
-                        placed = True
-                        break
-            if not placed:
-                result[day_idx].append(place)
-                logger.warning("  [재분배 실패] '%s' 넘길 날 없음, Day %d 유지", place["name"], day_idx + 1)
-
-    return result
+    return result, excluded
 
 
 # ─── 5. 핀 장소 통합 ──────────────────────────────────────────
@@ -397,7 +543,6 @@ def _check_pin_time_conflicts(
     regular_places: list[dict],
     current_min: int,
     transport_mode: str,
-    pace: str,
 ) -> list[str]:
     warnings_list = []
     prev_time = current_min
@@ -407,12 +552,12 @@ def _check_pin_time_conflicts(
         pin_min = parse_time_to_minutes(pin["time"])
         if prev_place is not None:
             travel = calculate_travel_time(prev_place, pin["place"], transport_mode)
-            earliest_arrival = prev_time + int(travel)
+            earliest_arrival = prev_time + int(travel["time"])
             if earliest_arrival > pin_min:
                 warnings_list.append(
                     f"'{pin['place']['name']}' {pin['time']} 도착은 "
                     f"이전 일정 기준 최소 {minutes_to_time_str(earliest_arrival)} 이후 가능 "
-                    f"(이동시간 추정 {int(travel)}분 포함)"
+                    f"(이동시간 추정 {int(travel['time'])}분 포함)"
                 )
         prev_time  = pin_min + pin["place"].get("stay", 60)
         prev_place = pin["place"]
@@ -426,7 +571,6 @@ def _apply_pinned(
     day_num: int,
     current_start_min: int,
     transport_mode: str,
-    pace: str,
 ) -> tuple[list, list[str]]:
     pins = [info for info in pinned_info.values() if info["day"] == day_num]
     if not pins:
@@ -442,7 +586,7 @@ def _apply_pinned(
     untimed = [p for p in pins if not p.get("time")]
 
     pin_warnings = _check_pin_time_conflicts(
-        timed, regular, current_start_min, transport_mode, pace
+        timed, regular, current_start_min, transport_mode
     )
 
     untimed_places = []
@@ -497,11 +641,11 @@ def _find_meal_times(start_min: int, end_min: int, prefs: dict) -> list:
     if 11*60+30 <= lunch  <= 14*60 and start_min <= lunch  <= end_min:
         result.append({"type": "lunch",  "time": lunch,
                        "time_str": minutes_to_time_str(lunch),
-                       "window_start": lunch  - 30, "window_end": lunch  + 30})
+                       "window_start": lunch  - 45, "window_end": lunch  + 45})
     if 17*60+30 <= dinner <= 20*60 and start_min <= dinner <= end_min:
         result.append({"type": "dinner", "time": dinner,
                        "time_str": minutes_to_time_str(dinner),
-                       "window_start": dinner - 30, "window_end": dinner + 30})
+                       "window_start": dinner - 45, "window_end": dinner + 45})
     return result
 
 
@@ -530,6 +674,8 @@ def _arrange_meals_in_places(
 
     result = list(places)
 
+    used_meal_names: set[str] = set()  # 이미 배치된 맛집 추적
+
     for meal in meal_times:
         # 각 장소의 추정 도착 분 계산 (체류 + 이동시간 모두 포함)
         def _estimated_minute(idx: int) -> int:
@@ -537,19 +683,29 @@ def _arrange_meals_in_places(
                 result[j].get("stay", avg_stay) + avg_travel for j in range(idx)
             )
 
-        # 이미 window 안에 맛집이 있으면 스킵
+        # 이미 window 안에 맛집이 있으면 스킵 (이미 배치된 것 제외)
         in_window = any(
             result[i].get("category") == "맛집"
+            and result[i].get("name") not in used_meal_names
             and meal["window_start"] <= _estimated_minute(i) <= meal["window_end"]
             for i in range(len(result))
         )
         if in_window:
+            # window 안에 있는 맛집을 used로 마킹
+            for i in range(len(result)):
+                if (result[i].get("category") == "맛집"
+                        and result[i].get("name") not in used_meal_names
+                        and meal["window_start"] <= _estimated_minute(i) <= meal["window_end"]):
+                    used_meal_names.add(result[i]["name"])
+                    break
             continue
 
-        # unpinned 맛집 후보 중 첫 번째 선택
+        # 아직 배치 안 된 unpinned 맛집 후보 중 첫 번째 선택
         candidate_idx = next(
             (i for i, p in enumerate(result)
-             if p.get("category") == "맛집" and not p.get("pinned")),
+             if p.get("category") == "맛집"
+             and not p.get("pinned")
+             and p.get("name") not in used_meal_names),
             None
         )
         if candidate_idx is None:
@@ -566,6 +722,7 @@ def _arrange_meals_in_places(
 
         # 위치 이동
         candidate = result.pop(candidate_idx)
+        used_meal_names.add(candidate["name"])
         if candidate_idx < best_insert_idx:
             best_insert_idx -= 1
         result.insert(best_insert_idx, candidate)
@@ -577,39 +734,82 @@ def _arrange_meals_in_places(
 
     return result
 
-def human_like_route(day_places):
-    관광지 = [p for p in day_places if p["category"] == "관광지"]
-    맛집   = [p for p in day_places if p["category"] == "맛집"]
-    카페   = [p for p in day_places if p["category"] == "카페"]
-    기타   = [p for p in day_places if p["category"] not in ["관광지", "맛집", "카페"]]
+def _route_distance(route: list[dict]) -> float:
+    return sum(haversine_distance(route[i], route[i + 1]) for i in range(len(route) - 1))
 
-    # 랜드마크 먼저 (경복궁 같은 거)
-    관광지.sort(key=lambda p: not p.get("is_landmark", False))
 
-    result = []
+def _diversify_categories(route: list[dict], max_run: int = 2) -> list[dict]:
+    """
+    같은 카테고리가 max_run개 넘게 연달아 나오면, 다른 카테고리 장소와
+    자리를 바꿔서 완화한다. 거리 증가가 가장 적은 교환만 적용한다.
 
-    # 오전 관광
-    result += 관광지[:2]
+    거리 최적화(optimized_route)만 쓰면 우연히 카페 3곳이 지리적으로
+    뭉쳐있을 때 "카페만 연속 3번 방문" 같은 부자연스러운 동선이 나올 수
+    있어서, 순수 거리 최적화 뒤에 이 보정을 한 번 더 거친다.
+    """
+    route = list(route)
+    n = len(route)
+    guard = 0
 
-    # 점심
-    if 맛집:
-        result.append(맛집.pop(0))
+    while guard < n * 2:
+        guard += 1
+        run_found = False
 
-    # 카페
-    if 카페:
-        result.append(카페.pop(0))
+        for i in range(n - max_run):
+            window = route[i:i + max_run + 1]
+            categories = {p["category"] for p in window}
+            if len(categories) != 1:
+                continue
 
-    # 오후 관광
-    result += 관광지[2:4]
+            run_found = True
+            target = i + max_run
+            run_category = route[target]["category"]
 
-    # 저녁
-    if 맛집:
-        result.append(맛집.pop(0))
+            best_j, best_dist = None, _route_distance(route)
+            for j in range(n):
+                if i <= j <= target or route[j]["category"] == run_category:
+                    continue
+                trial = list(route)
+                trial[target], trial[j] = trial[j], trial[target]
+                d = _route_distance(trial)
+                if d < best_dist:
+                    best_dist = d
+                    best_j = j
 
-    # 남은 것들
-    result += 관광지[4:] + 카페 + 맛집 + 기타
+            if best_j is not None:
+                route[target], route[best_j] = route[best_j], route[target]
+            break  # 하나 고쳤으면 처음부터 다시 스캔 (교환이 다른 구간에 영향을 줄 수 있음)
 
-    return result
+        if not run_found:
+            break
+
+    return route
+
+
+def human_like_route(day_places, transport_mode: str = "대중교통"):
+    """
+    하루치 장소들의 방문 순서를 정한다.
+
+    랜드마크가 있으면 그곳을 아침 첫 방문지로 고정하고, 나머지는 전부
+    optimized_route()(최근접 이웃 + 2-opt)로 실제 거리 기준 최단 동선을 짠 뒤,
+    같은 카테고리가 3번 넘게 연달아 나오면 _diversify_categories()로 완화한다.
+    식사 시간대 배치는 이후 _arrange_meals_in_places()가 순서와 무관하게
+    별도로 조정하므로 여기서는 식사 타이밍을 신경 쓰지 않는다.
+
+    ⚠️ 예전에는 카테고리별로 그룹을 나눠 고정 패턴(관광지 2 → 맛집 1 → 카페 1 → ...)으로
+       배치했는데, 그룹 내부 순서가 입력 순서를 그대로 따라가다 보니 위경도를 전혀
+       고려하지 않아 동선이 지그재그로 튀는 문제가 있었다 (실측: 같은 6곳 기준 약 4.8배
+       더 먼 거리). 이제는 거리 기반으로 순서를 정하고, 카테고리 쏠림만 별도로 보정한다.
+    """
+    if not day_places:
+        return []
+
+    landmarks = [p for p in day_places if p.get("is_landmark")]
+    start = landmarks[0] if landmarks else day_places[0]
+    remaining = [p for p in day_places if p is not start]
+
+    route = [start] + optimized_route(remaining, start, transport_mode)
+    return _diversify_categories(route)
 
 def _build_day_timeline(
     day_idx: int,
@@ -623,7 +823,7 @@ def _build_day_timeline(
     daily_end_time: str,
     prefs_dict: dict,
     pinned_info: dict,
-    pace: str,
+    call_counter: CallCounter | None = None,
 ) -> dict:
     start_h, start_m = map(int, daily_start_time.split(":"))
     end_h,   end_m   = map(int, daily_end_time.split(":"))
@@ -638,13 +838,14 @@ def _build_day_timeline(
 
     day_places, pin_warnings = _apply_pinned(
         day_places, pinned_info, day_idx + 1,
-        current_min, transport_mode, pace,
+        current_min, transport_mode,
     )
 
     if not day_places:
         return _empty_day(day_idx, daily_start_time, daily_end_time, pin_warnings)
 
     timeline: list[dict] = []
+    excluded_places: list[dict] = []
     total_travel, total_stay = 0.0, 0
     has_departure = False
     sorted_places: list[dict] = []
@@ -664,8 +865,9 @@ def _build_day_timeline(
         else:
             stay_min = 0
 
-        sorted_places = human_like_route(day_places)
-        first_travel = int(calculate_travel_time(dep_dict, sorted_places[0], transport_mode)) if sorted_places else 0
+        sorted_places = human_like_route(day_places, transport_mode)
+        first_travel_info = calculate_travel_time(dep_dict, sorted_places[0], transport_mode, call_counter) if sorted_places else {"time": 0, "payment": None, "transfer": None}
+        first_travel = int(first_travel_info["time"])
 
         timeline.append({
             "place":           explicit_departure.name,
@@ -675,6 +877,8 @@ def _build_day_timeline(
             "lng":             explicit_departure.lng,
             "stay_minutes":    stay_min,
             "travel_minutes":  first_travel,
+            "travel_payment":  first_travel_info["payment"],
+            "travel_transfer": first_travel_info["transfer"],
             "time":            minutes_to_time_str(current_min),
             "type":            "arrival" if day_idx == 0 else "transfer_start",
             "pinned":          False,
@@ -689,16 +893,32 @@ def _build_day_timeline(
 
     # ── 출발지 없음: 숙소 or 첫 장소 기준 ────────────────────
     else:
-        if start_location:
-            sorted_places = human_like_route(day_places)
-            if is_move_day:
-                prev_hotel = _get_hotel_for_night(hotels, day_idx - 1)
-                if prev_hotel and sorted_places:
-                    t = calculate_travel_time(prev_hotel, sorted_places[0], transport_mode)
-                    total_travel += t
-                    current_min  += int(t)
-        else:
-            sorted_places = human_like_route(day_places)
+        sorted_places = human_like_route(day_places, transport_mode)
+
+        # 2일차 이후 숙소 출발 노드 추가
+        if start_location and day_idx > 0:
+            first_travel_info = calculate_travel_time(
+                start_location, sorted_places[0], transport_mode, call_counter
+            ) if sorted_places else {"time": 0, "payment": None, "transfer": None}
+            first_travel = int(first_travel_info["time"])
+
+            timeline.append({
+                "place":           start_location["name"],
+                "category":        "숙소",
+                "address":         start_location.get("address", ""),
+                "lat":             start_location.get("lat"),
+                "lng":             start_location.get("lng"),
+                "stay_minutes":    0,
+                "travel_minutes":  first_travel,
+                "travel_payment":  first_travel_info["payment"],
+                "travel_transfer": first_travel_info["transfer"],
+                "time":            minutes_to_time_str(current_min),
+                "type":            "hotel_checkout",
+                "pinned":          False,
+            })
+            total_travel += first_travel
+            current_min  += first_travel
+            has_departure = True
 
     # ── 식사 시간 배치 ────────────────────────────────────────
     # sorted_places(time 필드 없음) 상태에서 직접 호출.
@@ -707,101 +927,84 @@ def _build_day_timeline(
     avg_stay_for_meal = int(
         sum(p.get("stay", 75) for p in sorted_places) / len(sorted_places)
     ) if sorted_places else 75
-    # avg_travel: 장소 간 평균 이동시간 추정 (식사 window 판단 정확도 개선)
-    # avg_travel_for_meal = 20
-    avg_travel_for_meal = int(total_travel / len(sorted_places)) if sorted_places else 30
+    # avg_travel: 고정 추정값 사용 (숙소 출발 노드 포함 시 total_travel이 0이어서 나눗셈 오류 방지)
+    avg_travel_for_meal = 20
     sorted_places = _arrange_meals_in_places(
         sorted_places, meal_times, current_min, avg_stay_for_meal, avg_travel_for_meal
     )
 
-    # # ── 장소 방문 ───────────────────────────────────────────────
-    # travel_minutes_list: list[int] = []
-    # used_lunch = False
-    # lunch_time = next((m["time"] for m in meal_times if m["type"] == "lunch"), None)
-
-    # for i, place in enumerate(sorted_places):
-    #     if (
-    #         place["category"] == "맛집"
-    #         and not used_lunch
-    #         and lunch_time
-    #         and abs(current_min - lunch_time) <= 90
-    #         ):            
-    #         if current_min < lunch_time:
-    #             current_min = lunch_time
-            
-    #         # 점심 시간보다 너무 늦으면 앞으로 당김
-    #         elif current_min > lunch_time + 60:
-    #             current_min = lunch_time
-
-    #         used_lunch = True
-
-    #     if place.get("pinned") and place.get("pinned_time"):
-    #         pm = parse_time_to_minutes(place["pinned_time"])
-    #         if pm > current_min:
-    #             current_min = pm
-
-    #     # 다음 장소까지 이동 시간 미리 계산 (desc에 포함)
-    #     next_travel = 0
-    #     if i < len(sorted_places) - 1:
-    #         next_travel = int(calculate_travel_time(place, sorted_places[i + 1], transport_mode))
-
-    #     timeline.append({
-    #         "place":           place["name"],
-    #         "category":        place["category"],
-    #         "address":         place.get("address", ""),
-    #         "stay_minutes":    place["stay"],
-    #         "travel_minutes":  next_travel,  # 다음 장소까지 이동시간 (추정)
-    #         "time":            minutes_to_time_str(current_min),
-    #         "type":            "visit",
-    #         "pinned":          place.get("pinned", False),
-    #     })
-    #     total_stay  += place["stay"]
-    #     current_min += place["stay"]
-
-    #     if next_travel > 0:
-    #         total_travel += next_travel
-    #         current_min  += next_travel
     # ── 장소 방문 ───────────────────────────────────────────────
     travel_minutes_list: list[int] = []
 
-    used_lunch = False
-    lunch_time = next((m["time"] for m in meal_times if m["type"] == "lunch"), None)
+    used_lunch  = False
+    used_dinner = False
+    lunch_time  = next((m["time"] for m in meal_times if m["type"] == "lunch"),  None)
+    dinner_time = next((m["time"] for m in meal_times if m["type"] == "dinner"), None)
 
     for i, place in enumerate(sorted_places):
 
-        # 👉 다음 장소 이동시간 미리 계산
+        # 다음 장소 이동시간 미리 계산
         next_travel = 0
+        next_travel_payment = None
+        next_travel_transfer = None
         if i < len(sorted_places) - 1:
-            next_travel = int(
-                calculate_travel_time(place, sorted_places[i + 1], transport_mode)
-            )
+            next_travel_info = calculate_travel_time(place, sorted_places[i + 1], transport_mode, call_counter)
+            next_travel = int(next_travel_info["time"])
+            next_travel_payment = next_travel_info["payment"]
+            next_travel_transfer = next_travel_info["transfer"]
 
-        # 👉 이전 장소 → 현재 장소 이동시간
+        # 이전 장소 → 현재 장소 이동시간
         prev_travel = 0
         if i > 0:
             prev_travel = int(
-                calculate_travel_time(sorted_places[i - 1], place, transport_mode)
+                calculate_travel_time(sorted_places[i - 1], place, transport_mode, call_counter)["time"]
             )
 
-        # 👉 "도착 시간" 기준 계산 (핵심)
+        # "도착 시간" 기준 계산 (핵심)
         arrival_time = current_min + prev_travel
 
-        # 🔥 점심 처리 (위치 + 시간 기반)
+        # 점심 처리 — arrival이 lunch_time ±30분 이내일 때만 시간 스냅
+        # 너무 이르면(arrival < lunch_time - 30) lunch_time까지 대기
         if (
             place["category"] == "맛집"
             and not used_lunch
             and lunch_time
-            and (lunch_time - 60) <= arrival_time <= (lunch_time + 60)
         ):
-            # 점심 시간에 맞춰 이동
-            current_min = lunch_time
-            used_lunch = True
+            if arrival_time < lunch_time - 30:
+                # 아직 점심 시간이 아님 → lunch_time까지 기다렸다가 먹기
+                current_min = lunch_time
+                used_lunch = True
+            elif arrival_time <= lunch_time + 30:
+                # 점심 window 안 → 스냅
+                current_min = max(current_min, lunch_time)
+                used_lunch = True
+            # lunch_time + 30 초과면 점심 타이밍 놓친 것 → 스냅 없이 그냥 진행
 
-        # 🔥 카페 시간 제한 (UX 개선)
+        # 저녁 처리 — arrival이 dinner_time ±30분 이내일 때만 시간 스냅
+        elif (
+            place["category"] == "맛집"
+            and used_lunch
+            and not used_dinner
+            and dinner_time
+        ):
+            if arrival_time < dinner_time - 30:
+                current_min = dinner_time
+                used_dinner = True
+            elif arrival_time <= dinner_time + 30:
+                current_min = max(current_min, dinner_time)
+                used_dinner = True
+
+        # 카페 시간 제한 (UX 개선) — 오전 카페는 일정에서 제외하고 사유를 기록
         if place["category"] == "카페" and current_min < 14 * 60:
-            continue  # 오전 카페 제거
+            excluded_places.append({
+                "name":     place["name"],
+                "category": place["category"],
+                "day":      day_idx + 1,
+                "reason":   "morning_cafe",
+            })
+            continue
 
-        # 🔥 pinned 시간 우선
+        # pinned 시간 우선
         if place.get("pinned") and place.get("pinned_time"):
             pm = parse_time_to_minutes(place["pinned_time"])
             if pm > current_min:
@@ -816,6 +1019,8 @@ def _build_day_timeline(
             "lng":             place.get("lng"),
             "stay_minutes":    place["stay"],
             "travel_minutes":  next_travel,
+            "travel_payment":  next_travel_payment,
+            "travel_transfer": next_travel_transfer,
             "time":            minutes_to_time_str(current_min),
             "type":            "visit",
             "pinned":          place.get("pinned", False),
@@ -834,12 +1039,15 @@ def _build_day_timeline(
     if day_idx == n_days - 1 and return_point:
         return_travel = 0
         if sorted_places:
-            return_travel = int(calculate_travel_time(sorted_places[-1], return_point, transport_mode))
+            return_travel_info = calculate_travel_time(sorted_places[-1], return_point, transport_mode, call_counter)
+            return_travel = int(return_travel_info["time"])
             total_travel += return_travel
             current_min  += return_travel
             # 마지막 방문 장소의 travel_minutes를 복귀 이동시간으로 소급 수정
             if timeline:
-                timeline[-1]["travel_minutes"] = return_travel
+                timeline[-1]["travel_minutes"]  = return_travel
+                timeline[-1]["travel_payment"]  = return_travel_info["payment"]
+                timeline[-1]["travel_transfer"] = return_travel_info["transfer"]
         timeline.append({
             "place":          return_point.get("name", "출발지"),
             "category":       "출발지",
@@ -858,12 +1066,15 @@ def _build_day_timeline(
     elif day_idx < n_days - 1 and tonight_hotel:
         hotel_travel = 0
         if sorted_places:
-            hotel_travel = int(calculate_travel_time(sorted_places[-1], tonight_hotel, transport_mode))
+            hotel_travel_info = calculate_travel_time(sorted_places[-1], tonight_hotel, transport_mode, call_counter)
+            hotel_travel = int(hotel_travel_info["time"])
             total_travel += hotel_travel
             current_min  += hotel_travel
             # 마지막 방문 장소의 travel_minutes를 숙소 이동시간으로 소급 수정
             if timeline:
-                timeline[-1]["travel_minutes"] = hotel_travel
+                timeline[-1]["travel_minutes"]  = hotel_travel
+                timeline[-1]["travel_payment"]  = hotel_travel_info["payment"]
+                timeline[-1]["travel_transfer"] = hotel_travel_info["transfer"]
 
         is_checkin = any(
             h.check_in_day == day_idx + 1 for h in hotels
@@ -928,6 +1139,7 @@ def _build_day_timeline(
         "meal_times":        meal_times,
         "category_warnings": cat_warnings,
         "pin_warnings":      pin_warnings,
+        "excluded_places":   excluded_places,
     }
 
 
@@ -941,6 +1153,7 @@ def _empty_day(day_idx: int, start_time: str, end_time: str, pin_warnings: list 
         "hotel_info": None, "departure_info": None,
         "meal_times": [], "category_warnings": [],
         "pin_warnings": pin_warnings or [],
+        "excluded_places": [],
     }
 
 
@@ -1006,18 +1219,47 @@ def generate_itinerary(
         enriched, pinned_info, n_days, hotels, departure_points
     )
 
-    avg_stay    = int(sum(p["stay"] for p in enriched) / len(enriched)) if enriched else 75
-    max_per_day = _calc_max_places_per_day(
-        start_h, start_m, end_h, end_m,
-        avg_stay=avg_stay, avg_travel=30,
-    )
-    logger.info("[재분배] 하루 최대 장소 수: %d개 (avg_stay=%d분)", max_per_day, avg_stay)
+    # 지리적 배정은 카테고리를 고려하지 않으므로, 하루 식사 슬롯(점심/저녁) 수를
+    # 넘는 맛집은 여기서 미리 제외한다 — 그대로 두면 식사 시간에 못 맞춘 여분의
+    # 맛집이 다른 맛집 옆에 나란히 배치되는 문제가 생긴다.
+    # "식사 시간 포함"을 꺼서 lunch/dinner가 사실상 비활성(23:59)인 경우나,
+    # 하루가 너무 짧아 식사 window가 하나도 안 잡히는 경우엔 slot_count=0이
+    # 되는데, 이때는 맛집을 아예 다 잘라내면 안 되므로 캡을 적용하지 않는다.
+    meal_slot_count = len(_find_meal_times(
+        start_h * 60 + start_m, end_h * 60 + end_m, prefs_dict
+    ))
+    if meal_slot_count > 0:
+        day_assignments, meal_cap_excluded = _cap_meal_places(
+            day_assignments, day_anchors, meal_slot_count
+        )
+    else:
+        meal_cap_excluded = []
 
-    day_assignments = _redistribute(
+    # 카페도 같은 이유로 하루 개수를 페이스 기반으로 제한한다 (tight=1, normal/relaxed=2).
+    day_assignments, cafe_cap_excluded = _cap_cafe_places(
+        day_assignments, day_anchors, pace
+    )
+
+    avg_stay      = int(sum(p["stay"] for p in enriched) / len(enriched)) if enriched else 75
+    available_min = (end_h * 60 + end_m) - (start_h * 60 + start_m)
+    meal_buffer   = 60  # 점심·저녁 식사 시간 확보
+
+    # pace에 따라 하루 최대 장소 수 조정
+    # tight(효율적): 가능한 많이 / normal(균형): 80% / relaxed(여유): 60%
+    _PACE_PLACE_RATIO = {"tight": 1.0, "normal": 0.8, "relaxed": 0.6}
+    pace_ratio  = _PACE_PLACE_RATIO.get(pace, 0.8)
+    max_per_day = max(1, int((available_min - meal_buffer) // (avg_stay + 35) * pace_ratio))
+    logger.info(
+        "[최적화] 하루 최대 장소 수: %d개 (avg_stay=%d분, 가용=%d분, pace=%s×%.1f)",
+        max_per_day, avg_stay, available_min - meal_buffer, pace, pace_ratio
+    )
+
+    day_assignments, redistribute_excluded = _redistribute(
         day_assignments, day_anchors, max_per_day, hotels, transport_mode
     )
 
     result: dict = {}
+    call_counter = CallCounter()  # 일정 생성 1회당 ODsay API 호출 상한 카운터
     for day_idx in range(n_days):
         date_info = dates_info[day_idx] if dates_info else None
         day_data  = _build_day_timeline(
@@ -1032,8 +1274,13 @@ def generate_itinerary(
             daily_end_time   = daily_end_time,
             prefs_dict       = prefs_dict,
             pinned_info      = pinned_info,
-            pace             = pace,
+            call_counter     = call_counter,
         )
+        # 재분배 단계(용량 초과·식사 슬롯 초과·카페 상한 초과)에서 이 날짜에 제외된 장소도 함께 보고
+        day_data["excluded_places"] = day_data.get("excluded_places", []) + [
+            e for e in redistribute_excluded + meal_cap_excluded + cafe_cap_excluded
+            if e["day"] == day_idx + 1
+        ]
         day_key = f"day_{day_idx + 1}"
         result[day_key] = {
             "date":     date_info["formatted"] if date_info else f"Day {day_idx + 1}",

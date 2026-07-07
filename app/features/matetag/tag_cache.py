@@ -1,11 +1,10 @@
 import httpx
 from functools import lru_cache
-
-SPRING_BOOT_URL = "http://localhost:8080"  # application.yml 포트에 맞춰
+import os
 
 @lru_cache(maxsize=1)
 def get_tag_cache() -> dict[str, set[str]]:
-    response = httpx.get(f"{SPRING_BOOT_URL}/api/mate/tags")
+    response = httpx.get(f"{os.getenv('SPRING_BOOT_URL')}/api/mate/tags")
     response.raise_for_status()
 
     result = {"style": set(), "vibe": set()}

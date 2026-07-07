@@ -75,3 +75,7 @@ pip-delete-this-directory.txt
 *.iml
 .DS_Store
 Thumbs.db
+
+
+# .gitignore
+features/schedule/odsay_cache.json

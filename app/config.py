@@ -16,6 +16,7 @@ NAVER_CLIENT_ID: str | None = os.getenv("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET: str | None = os.getenv("NAVER_CLIENT_SECRET")
 NAVER_MAP_CLIENT_ID: str | None = os.getenv("NAVER_MAP_CLIENT_ID")
 NAVER_MAP_CLIENT_SECRET: str | None = os.getenv("NAVER_MAP_CLIENT_SECRET")
+ODSAY_API_KEY: str | None = os.getenv("ODSAY_API_KEY")
 
 CLOVA_API_KEY: str | None = os.getenv("CLOVA_API_KEY")
 CLOVA_API_URL: str | None = os.getenv("CLOVA_API_URL")

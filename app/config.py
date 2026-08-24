@@ -20,3 +20,6 @@ ODSAY_API_KEY: str | None = os.getenv("ODSAY_API_KEY")
 
 CLOVA_API_KEY: str | None = os.getenv("CLOVA_API_KEY")
 CLOVA_API_URL: str | None = os.getenv("CLOVA_API_URL")
+
+BADWORD_API_KEY: str | None = os.getenv("BADWORD_API_KEY")
+BADWORD_API_URL: str | None = os.getenv("BADWORD_API_URL")

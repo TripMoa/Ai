@@ -79,3 +79,4 @@ Thumbs.db
 
 # .gitignore
 features/schedule/odsay_cache.json
+features/schedule/odsay_usage.json

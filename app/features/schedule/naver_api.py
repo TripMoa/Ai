@@ -1,3 +1,4 @@
+import asyncio
 import re
 import requests
 from config import (
@@ -18,7 +19,9 @@ async def geocode_address(address: str) -> dict:
 
     print(f"Geocoding API: '{address}'")
     try:
-        res = requests.get(
+        # 동기 requests를 그대로 부르면 응답을 기다리는 동안 이벤트 루프가 멈추므로 스레드에서 실행한다
+        res = await asyncio.to_thread(
+            requests.get,
             "https://maps.apigw.ntruss.com/map-geocode/v2/geocode",
             headers={
                 "x-ncp-apigw-api-key-id": NAVER_MAP_CLIENT_ID,
@@ -60,17 +63,21 @@ async def geocode_address(address: str) -> dict:
 
 
 async def local_search(query: str, display: int = 10) -> dict:
-    """상호명/키워드 검색 (지역 검색 API, 무료)"""
+    """상호명/키워드 검색 (지역 검색 API, 무료)
+    2027-06-30부로 openapi.naver.com 구버전 지원 종료 예정 — NAVER API HUB로 이관
+    (https://guide.ncloud-docs.com/docs/apihub-migration)
+    """
     if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
         return {"success": False, "places": [], "error": "Search API key not configured"}
 
     print(f"지역 검색 API: '{query}'")
     try:
-        res = requests.get(
-            "https://openapi.naver.com/v1/search/local.json",
+        res = await asyncio.to_thread(
+            requests.get,
+            "https://naverapihub.apigw.ntruss.com/search/v1/local",
             headers={
-                "X-Naver-Client-Id": NAVER_CLIENT_ID,
-                "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+                "X-NCP-APIGW-API-KEY-ID": NAVER_CLIENT_ID,
+                "X-NCP-APIGW-API-KEY": NAVER_CLIENT_SECRET,
             },
             params={"query": query, "display": display, "sort": "random"},
             timeout=5,

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, model_validator, field_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 from typing import Optional, Dict, List
 
 # ─── 카테고리 정규화 맵 ───────────────────────────────────────
@@ -42,7 +42,7 @@ class PinnedPlace(BaseModel):
 class UserPreferences(BaseModel):
     pace: str = "normal"        # tight | normal | relaxed
     lunch_time: str = "12:00"
-    dinner_time: str = "18:00"
+    dinner_time: str = "18:30"
 
 
 # ─── 다중 숙소 ────────────────────────────────────────────────
@@ -104,6 +104,36 @@ class ItineraryRequest(BaseModel):
                 seen_days.add(dp.day)
         self.departure_points = deduped
         return self
+
+
+class TransitPoint(BaseModel):
+    lat: float = Field(ge=-90, le=90)
+    lng: float = Field(ge=-180, le=180)
+
+
+class TransitRequest(BaseModel):
+    """사용자가 일정 화면에서 구간을 눌렀을 때 실시간 대중교통 경로를 묻는 요청"""
+    start: TransitPoint
+    end: TransitPoint
+
+
+class RecomputeItem(BaseModel):
+    name: str = ""
+    category: str = "관광지"
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    stay_minutes: Optional[int] = Field(default=None, ge=0, le=720)
+    pinned_time: Optional[str] = None
+
+
+class RecomputeDayRequest(BaseModel):
+    """순서가 정해진 하루의 시각 재계산 요청"""
+    items: List[RecomputeItem] = []
+    start_time: str = "09:00"
+    end_time: str = "21:00"
+    transportation_mode: str = "대중교통"
+    lunch_time: str = "12:00"
+    dinner_time: str = "18:30"
 
 
 class DistanceRequest(BaseModel):

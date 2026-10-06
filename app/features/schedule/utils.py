@@ -2,13 +2,42 @@ import re
 import logging
 from math import radians, sin, cos, sqrt, atan2
 from datetime import datetime, timedelta
+import config as _config
 from config import ODSAY_API_KEY
-from features.schedule.odsay_api import get_transit_time, get_cached_transit_time, CallCounter
+from features.schedule.odsay_api import get_transit_time, CallCounter
 
 logger = logging.getLogger(__name__)
 
 # 대중교통 모드에서도 이 거리(km) 이내는 도보가 더 현실적이라고 보고 도보로 전환
 WALK_OVERRIDE_KM = 1.0
+
+# 일정 생성 중에도 ODsay를 부를지(기본 꺼짐) — 무료 한도(30건/일)와 결과 저장 금지 약관 때문에
+# 생성은 아래 추정식으로 하고, 실제 경로는 사용자가 눌렀을 때만 실시간 조회한다.
+ODSAY_ON_GENERATE = bool(getattr(_config, "ODSAY_ON_GENERATE", False))
+
+
+# 직선거리(km) → 대중교통 예상 소요(분) 기준점. 문 앞에서 문 앞까지(도보 접근·환승·대기 포함).
+# 기준점 사이는 직선으로 잇는다(구간 경계에서 값이 튀지 않고 거리가 늘면 항상 늘어난다).
+#   0.5km  도보(시속 4km, 직선거리 ×1.4)
+#   2km    시내 이동 시작 — 접근·대기 포함 약 18분
+#   10km   시내 중장거리 약 42분
+#   30km   수도권 광역 이동 약 85분
+#   100km  광역철도·고속철도 등 도시 간 이동 약 135분 (터미널 접근·대기 포함)
+#   300km  장거리 도시 간(고속철도) 약 240분
+# 300km를 넘으면 마지막 구간의 기울기(km당 약 0.53분)로 이어서 늘린다.
+_TRANSIT_ANCHORS = [(0.0, 0.0), (0.5, 10.5), (2.0, 18.0), (10.0, 42.0), (30.0, 85.0), (100.0, 135.0), (300.0, 240.0)]
+
+
+def estimate_transit_minutes(d: float) -> float:
+    """직선거리(km) → 대중교통 예상 소요(분). 기준점(_TRANSIT_ANCHORS) 사이를 선형 보간한다."""
+    if d <= 0:
+        return 0.0
+    for (d0, t0), (d1, t1) in zip(_TRANSIT_ANCHORS, _TRANSIT_ANCHORS[1:]):
+        if d <= d1:
+            return t0 + (t1 - t0) * (d - d0) / (d1 - d0)
+    (d0, t0), (d1, t1) = _TRANSIT_ANCHORS[-2], _TRANSIT_ANCHORS[-1]
+    return t1 + (t1 - t0) / (d1 - d0) * (d - d1)
+
 
 # ─── 좌표 / 거리 ───────────────────────────────────────────────
 
@@ -38,7 +67,7 @@ def _travel_time_for_routing(place1: dict, place2: dict, mode: str = "대중교�
     경로 최적화(nearest_neighbor, 2-opt) 전용 이동시간 추정.
 
     ODsay API를 호출하지 않고 하버사인 거리 기반으로만 계산.
-    → API 한도(1,000건/일) 보호 목적.
+    → API 한도(무료 Basic은 30건/일) 보호 목적.
     → 실제 이동시간은 타임라인 확정 후 calculate_travel_time()이 담당.
     """
     if "출발지" in place1.get("category", "") or "출발지" in place2.get("category", ""):
@@ -56,17 +85,7 @@ def _travel_time_for_routing(place1: dict, place2: dict, mode: str = "대중교�
         return (d * 1.3 / 4) * 60
 
     elif mode == "대중교통":
-        # 캐시에 이미 실측값이 있으면(추가 API 호출 없이) 직선거리 추정보다 우선 사용
-        if ODSAY_API_KEY:
-            cached = get_cached_transit_time(place1["lat"], place1["lng"], place2["lat"], place2["lng"])
-            if cached and cached.get("time", 0) > 0:
-                return float(cached["time"])
-
-        road_d = d * 1.4
-        if d < 0.5:   return (road_d / 4) * 60
-        elif d < 2:   return (road_d / 20) * 60 + 10
-        elif d < 10:  return (road_d / 25) * 60 + 15
-        else:         return (road_d / 30) * 60 + 20
+        return estimate_transit_minutes(d)
 
     elif mode == "택시":
         road_d = d * 1.3
@@ -80,12 +99,7 @@ def _travel_time_for_routing(place1: dict, place2: dict, mode: str = "대중교�
 
 def _haversine_fallback(place1: dict, place2: dict, mode: str) -> float:
     """하버사인 기반 폴백 (대중교통 전용)"""
-    d = haversine_distance(place1, place2)
-    road_d = d * 1.4
-    if d < 0.5:   return (road_d / 4) * 60
-    elif d < 2:   return (road_d / 20) * 60 + 10
-    elif d < 10:  return (road_d / 25) * 60 + 15
-    else:         return (road_d / 30) * 60 + 20
+    return estimate_transit_minutes(haversine_distance(place1, place2))
 
 
 def _travel_result(time: float, payment: int | None = None, transfer: int | None = None) -> dict:
@@ -101,7 +115,7 @@ def calculate_travel_time(
     """
     교통수단별 이동 시간 추정.
 
-    대중교통: ODsay API 실측값 우선, 실패/상한 초과 시 하버사인 폴백.
+    대중교통: 직선거리 기반 추정(estimate_transit_minutes). ODSAY_ON_GENERATE=true일 때만 ODsay 실측을 먼저 쓴다.
     도보/택시: 하버사인 기반 추정치.
 
     call_counter:
@@ -114,7 +128,7 @@ def calculate_travel_time(
 
     Returns:
         {"time": float(분), "payment": int(원) | None, "transfer": int(횟수) | None}
-        payment/transfer는 ODsay 실측값이 있을 때만 채워짐.
+        payment/transfer는 ODsay 실측을 쓴 경우(ODSAY_ON_GENERATE=true)에만 채워짐.
     """
     d = haversine_distance(place1, place2)
 
@@ -129,9 +143,9 @@ def calculate_travel_time(
             return _travel_result(999)
         return _travel_result((d * 1.3 / 4) * 60)
 
-    # ── 대중교통: ODsay 우선 ──────────────────────────────────
+    # ── 대중교통: 기본은 추정, 스위치가 켜졌을 때만 ODsay 우선 ──────────
     elif mode == "대중교통":
-        if ODSAY_API_KEY:
+        if ODSAY_API_KEY and ODSAY_ON_GENERATE:
             result = get_transit_time(
                 start_lat=place1["lat"], start_lng=place1["lng"],
                 end_lat=place2["lat"],   end_lng=place2["lng"],
